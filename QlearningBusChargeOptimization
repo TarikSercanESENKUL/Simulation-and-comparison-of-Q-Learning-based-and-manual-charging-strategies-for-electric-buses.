@@ -1,0 +1,560 @@
+# -*- coding: utf-8 -*-
+"""
+Otobüs Batarya Şarj Optimizasyonu Simülasyonu (Q-Learning vs. Klasik Daima Şarj)
+1000 epizod, klima+regen dahil, karşılaştırmalı grafik ve şarj analizli.
+"""
+
+import pandas as pd
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# ==== 1. Klasör ve Dosya Yolları ====
+# Ana klasör ve gerekli veri dosyalarının yolları hazırlanıyor
+base_dir = r"C:/Users/MSI/Desktop/bildiri bıkkın/veriler"
+os.makedirs(base_dir, exist_ok=True)
+
+route_path    = os.path.join(base_dir, "route_with_distances.csv")     # Güzergah ve durak mesafeleri
+traffic_path  = os.path.join(base_dir, "sonuc.csv")                    # Trafik yoğunluk/hız verisi
+schedule_path = os.path.join(base_dir, "hat1_program.csv")             # Günlük otobüs sefer programı
+
+print(">> Veri dosyaları okunuyor...")
+route_df    = pd.read_csv(route_path, encoding="windows-1254")     # Rota mesafeleri okunuyor
+traffic_df  = pd.read_csv(traffic_path, encoding="windows-1254") # Trafik verisi okunuyor
+schedule_df = pd.read_csv(schedule_path, encoding="windows-1254") # Sefer programı okunuyor
+
+# ==== 2. Trafik Verisi Sözlüğü ====
+# Trafik verisi 1-7 Ocak 2024 arasına filtreleniyor, her saat ve durak koordinatı için hız ve yoğunluk dictionary'ye atanıyor
+print(">> Trafik verisi filtreleniyor ve sözlük hazırlanıyor...")
+traffic_df['DATE_TIME'] = pd.to_datetime(traffic_df['DATE_TIME'])
+mask = (traffic_df['DATE_TIME'] >= "2024-01-01") & (traffic_df['DATE_TIME'] < "2024-01-08")
+traffic_week = traffic_df.loc[mask].copy()
+traffic_week['DATE'] = traffic_week['DATE_TIME'].dt.date
+traffic_week['HOUR'] = traffic_week['DATE_TIME'].dt.hour
+traffic_data = {}
+for _, row in traffic_week.iterrows():
+    key = (row['DATE'], row['HOUR'], round(row['STOP_LATITUDE'], 6), round(row['STOP_LONGITUDE'], 6))
+    traffic_data[key] = (row['AVERAGE_SPEED'], row['TRAFFIC_DENSITY'])
+
+# ==== 3. Güzergah Durakları ve Mesafe Hesaplama ====
+print(">> Güzergah ve mesafe dizileri hazırlanıyor...")
+stops_kadikoy_to_kiraz = [0, 1, 3, 10, 11, 15, 23, 28]          # Kadıköy-Kirazlitepe yönündeki durak sıralaması
+stops_kiraz_to_kadikoy = [28, 32, 35, 38, 40, 46, 51, 55, 56, 57, 58, 0] # Kirazlitepe-Kadıköy yönü
+
+def compute_segment_distances(stop_sequence):
+    # Verilen güzergah için ardışık duraklar arasındaki toplam mesafeleri (metre) hesaplar
+    distances = []
+    for j in range(len(stop_sequence) - 1):
+        start_idx = stop_sequence[j]
+        end_idx = stop_sequence[j+1]
+        dist_sum = 0.0
+        if end_idx < start_idx: # Dönüşlerde end_idx baştan başlıyorsa
+            for k in range(start_idx, len(route_df) - 1):
+                if np.isnan(route_df.loc[k, 'distance_m']):
+                    continue
+                dist_sum += route_df.loc[k, 'distance_m']
+            for k in range(0, end_idx):
+                dist_sum += route_df.loc[k, 'distance_m']
+        else:
+            for k in range(start_idx, end_idx):
+                dist_sum += route_df.loc[k, 'distance_m']
+        distances.append(dist_sum)
+    return distances
+
+distances_kadikoy_to_kiraz = compute_segment_distances(stops_kadikoy_to_kiraz)
+distances_kiraz_to_kadikoy = compute_segment_distances(stops_kiraz_to_kadikoy)
+
+# ==== 4. Q-learning Parametreleri ve Yardımcı Fonksiyonlar ====
+CAPACITY = 350.0  # Otobüs batarya kapasitesi (ör: kWh)
+def discretize_battery(batt_level):
+    # Batarya seviyesini yüzdeye çevirip 10'luk aralıklara yuvarlar (state sayısı azalır)
+    perc = (batt_level / CAPACITY) * 100
+    perc = max(0, min(perc, 100))
+    discrete = int((perc // 10) * 10)
+    return discrete
+
+alpha = 0.3                # Q-learning öğrenme oranı
+gamma = 0.99               # Gelecek ödül katsayısı (discount factor)
+epsilon_start = 1.00       # Başlangıçta keşif oranı (exploration)
+epsilon_end   = 0.05       # Son epizotta minimum keşif
+num_episodes  = 1000       # Simülasyon epizodu (hafta) sayısı
+
+# ==== Parabolik Batarya Ceza Fonksiyonu ==== 
+def battery_penalty(soc):
+    """
+    soc: Batarya doluluk oranı (%) 0-100 arası beklenir.
+    %0 ve %100'de en büyük ceza (-100), %50'de ceza yok.
+    """
+    k = 0.004  # Ceza katsayısı: -0.04 * (0-50)^2 = -10
+    return -k * (soc - 50)**2
+
+
+
+
+# ==== 5. Haftalık Sefer Programını Hazırla ====
+# Gün türüne (iş günü/cumartesi/pazar) göre haftalık program birleştiriliyor
+day_types = ["İş Günü"] * 5 + ["Cumartesi", "Pazar"]
+dates = [f"2024-01-0{i}" for i in range(1,8)]
+seferler = []
+for ep, day_type in enumerate(day_types):
+    gun_schedule = schedule_df[schedule_df['Gün Türü'] == day_type].reset_index(drop=True)
+    gun_schedule['tarih'] = dates[ep]
+    seferler.append(gun_schedule)
+haftalik_program = pd.concat(seferler, ignore_index=True)
+
+def time_to_minutes(t_str):
+    # "hh:mm" formatlı stringi dakikaya çevirir
+    if pd.isna(t_str): return None
+    h, m = t_str.split(':')
+    return int(h) * 60 + int(m)
+haftalik_program['dep_min'] = haftalik_program['Kalkış Saati'].apply(time_to_minutes)
+haftalik_program['arr_min'] = haftalik_program['Varış Saati'].apply(time_to_minutes)
+def parse_break(break_str):
+    # "X saat Y dk" gibi mola sürelerini dakikaya çevirir
+    if pd.isna(break_str) or break_str.strip() == "":
+        return 0
+    s = break_str.lower()
+    total_min = 0
+    if "saat" in s:
+        parts = s.split("saat")
+        hrs = int(parts[0].strip()) if parts[0].strip() != "" else 0
+        total_min += hrs * 60
+        if "dk" in parts[1]:
+            mins_str = parts[1].split("dk")[0].strip()
+            total_min += int(mins_str) if mins_str != "" else 0
+    elif "dk" in s:
+        total_min += int(s.split("dk")[0].strip())
+    return total_min
+haftalik_program['break_min'] = haftalik_program['Mola Süresi'].apply(parse_break)
+
+# ==== Klima ve Rejeneratif Frenleme Parametreleri ====
+KLIMA_TUKETIM_BASE = 2.0  # Klima baz tüketimi (kWh/saat)
+T_MIN, T_MAX = 3.0, 8.0   # Simüle edilen sıcaklık aralığı
+REGEN_RATIO = 0.01        # Rejeneratif fren oranı (%1)
+
+# Gün/saat bazlı sıcaklıklar simüle ediliyor (örnek)
+temperature_data = {}
+for day in dates:
+    for hour in range(24):
+        if 6 <= hour < 18:
+            temp = random.uniform(6, 8)
+        else:
+            temp = random.uniform(3, 5)
+        temperature_data[(day, hour)] = temp
+
+# ==== 6. Q-Learning Otobüs Simülasyonu ====
+print(f">> Q-Learning Otobüs Eğitimi başlıyor: {num_episodes} epizod...")
+Q = {}                  # Q-tablosu, state-aksiyon değerleri
+results_fail_q = []     # Epizodda yolda kalma (0-yok, 1-var)
+results_charge_q = []   # Epizodda toplam şarj kararı
+results_success_q = []  # Epizodda tamamlanan başarılı sefer
+charge_log_q = []       # Şarj aksiyon logu
+reward_log = []         # Her aksiyon sonrası ödül logu
+results_reward_q = []   # Epizodun toplam ödülü
+
+for ep in range(1, num_episodes+1):
+    fail_flag = 0
+    charge_count = 0
+    success_count = 0
+    battery = CAPACITY   # Her epizoda tam dolu batarya ile başla
+    state = None
+    # Keşif oranı epizod ilerledikçe azalır (epsilon-greedy)
+    epsilon = epsilon_start + (epsilon_end - epsilon_start) * ((ep-1)/(num_episodes-1))
+    prev_avg_speed = None
+    next_departure_time = haftalik_program.loc[0, 'dep_min']
+    total_reward = 0.0
+
+    for idx in range(len(haftalik_program)):
+        reward = 0.0 # bunu forr döngüsünün hemen başına al
+        if idx == 0:
+            current_time = haftalik_program.loc[0, 'dep_min']
+        else:
+            current_time = next_departure_time
+
+        start_terminal = haftalik_program.loc[idx, 'Kalkış Noktası']
+        end_terminal   = haftalik_program.loc[idx, 'Varış Noktası']
+        tarih_str      = haftalik_program.loc[idx, 'tarih']
+        tarih_dt       = pd.to_datetime(tarih_str).date()
+        if start_terminal == "Kadıköy":
+            stops_seq = stops_kadikoy_to_kiraz
+            seg_distances = distances_kadikoy_to_kiraz
+            position_state = 0
+        else:
+            stops_seq = stops_kiraz_to_kadikoy
+            seg_distances = distances_kiraz_to_kadikoy
+            position_state = 1
+
+        # --- Q-learning aksiyon seçimi ---
+        if idx == 0:
+            action = 0  # İlk sefere başlarken şarj yapılmaz
+        else:
+            if state not in Q:
+                Q[state] = [0.0, 0.0]  # State için Q tablosunu başlat
+            if random.random() < epsilon:
+                action = random.choice([0, 1])  # Keşif: rastgele aksiyon seç
+            else:
+                action = 0 if Q[state][0] >= Q[state][1] else 1  # En iyi Q-değerli aksiyonu seç
+            if action == 1 and battery < CAPACITY * 0.80:
+               charge_count += 1
+               break_minutes = haftalik_program.loc[idx-1, 'break_min']
+               # Eklenecek enerji, %80’i geçmeyecek kadar olmalı!
+               max_add = CAPACITY * 0.80 - battery
+               added_energy = min((350.0 / 60.0) * break_minutes, max_add)
+               battery += added_energy
+               reward -= 0.8 * added_energy
+               curr_perc = (battery / CAPACITY) * 100
+               charge_log_q.append({
+                    "epizod": ep,
+                    "gun": tarih_str,
+                    "haftaici_gun": pd.to_datetime(tarih_str).strftime("%A"),
+                    "saat": int(current_time // 60) % 24,
+                    "sefer_no": idx + 1,
+                    "kalkis": start_terminal,
+                    "varis": end_terminal,
+                    "batarya_yuzde": round((battery / CAPACITY) * 100, 1)
+                })
+
+        reward = 0.0  # Her aksiyon için ödül başlatılır
+        for seg_idx, dist_m in enumerate(seg_distances):
+            dist_km = dist_m / 1000.0
+            hour = int(current_time // 60) % 24
+            # Trafik, hız ve yoğunluk alınır
+            traffic_key = (tarih_dt, hour, round(route_df.loc[stops_seq[seg_idx], 'lat'], 6), round(route_df.loc[stops_seq[seg_idx], 'lon'], 6))
+            avg_speed, density = traffic_data.get(traffic_key, (30, 1))
+            dens_factor = min(density / 5.0, 0.2)
+            speed_factor = (30 - avg_speed) / 30.0
+            if speed_factor < 0: speed_factor = 0
+
+            # Enerji tüketimi ve rejeneratif fren kazancı hesaplanır
+            consumption = dist_km * 1.4 * (1 + dens_factor) * (1 + speed_factor)
+            regen_energy = 0.0
+            if prev_avg_speed is not None and avg_speed < prev_avg_speed:
+                regen_energy = consumption * REGEN_RATIO
+                battery += regen_energy
+                if battery > CAPACITY:
+                    battery = CAPACITY
+            prev_avg_speed = avg_speed
+            battery -= consumption  # Enerji bataryadan düşülür
+
+            # Yolculuk süresi dakika olarak eklenir
+            travel_time_min = (dist_km / avg_speed) * 60.0 if avg_speed > 0 else 0.0
+            current_time += travel_time_min
+
+            # Klima tüketimi sıcaklığa göre eklenir
+            temp = temperature_data.get((tarih_str, hour), T_MIN)
+            temp_factor = (temp - T_MIN) / (T_MAX - T_MIN)
+            temp_factor = max(0, min(temp_factor, 1))
+            travel_time_hour = travel_time_min / 60.0
+            consumption_klima = KLIMA_TUKETIM_BASE * (1 + temp_factor) * travel_time_hour
+            battery -= consumption_klima
+
+            if seg_idx < len(seg_distances) - 1:
+                current_time += 1  # Duraklarda bekleme
+
+            if battery <= 0:
+                # Yolda kalırsa büyük ceza ve döngü biter
+                fail_flag = 1
+                reward += -5
+                total_reward += reward
+                reward_log.append({
+                    "epizod": ep,
+                    "sefer_no": idx + 1,
+                    "state": str(state),
+                    "action": action,
+                    "reward": reward,
+                    "battery": battery,
+                    "charge_count": charge_count,
+                    "fail_flag": fail_flag,
+                    "batarya_yuzde": round((battery / CAPACITY) * 100, 1)
+                })
+                break
+        if battery <= 0:
+            break
+
+        curr_perc = (battery / CAPACITY) * 100
+        reward += battery_penalty(curr_perc)
+        reward +=  1.0 # Her başarılı segment için temel ödül
+        success_count += 0.01
+        total_reward += reward
+
+        reward_log.append({
+            "epizod": ep,
+            "sefer_no": idx + 1,
+            "state": str(state),
+            "action": action,
+            "reward": reward,
+            "battery": battery,
+            "charge_count": charge_count,
+            "fail_flag": fail_flag,
+            "batarya_yuzde": round((battery / CAPACITY) * 100, 1)
+        })
+
+        # Q-tablosu güncelleniyor (Q-learning algoritmasının ana kısmı)
+        next_departure_time = current_time + haftalik_program.loc[idx, 'break_min']
+        if idx < len(haftalik_program) - 1:
+            next_state = (discretize_battery(battery), idx + 2, position_state)
+        else:
+            next_state = None
+
+        if idx > 0:
+            if next_state is not None:
+                if next_state not in Q:
+                    Q[next_state] = [0.0, 0.0]
+                next_max = max(Q[next_state][0], Q[next_state][1])
+            else:
+                next_max = 0.0
+            Q[state][action] += alpha * (reward + gamma * next_max - Q[state][action])
+        if next_state is not None:
+            state = next_state
+
+    # Epizod sonunda eğer hiç yolda kalmadıysa ekstra ödül verilir
+    if fail_flag == 0 and success_count == len(haftalik_program):
+        total_reward += 2.0
+
+    results_fail_q.append(fail_flag)
+    results_charge_q.append(charge_count)
+    results_success_q.append(success_count)
+    results_reward_q.append(total_reward)
+    # Tüm epizodların ödülleri toplandıktan SONRA!
+rewards = np.array(results_reward_q)
+min_reward = rewards.min()
+max_reward = rewards.max()
+norm_rewards = -10 * (1 - (rewards - min_reward) / (max_reward - min_reward))
+
+
+# Q-Learning döngüsü sonrası sonuç logları kaydediliyor
+pd.DataFrame(reward_log).to_csv(os.path.join(base_dir, "qlearning_action_rewards_log.csv"), index=False)
+
+# ==== 7. Klasik Otobüs Simülasyonu (Her sefer sonu şarj) ====
+print(f">> Klasik Otobüs (her sefer sonu şarj) simülasyonu başlıyor: {num_episodes} epizod...")
+results_fail_classic = []
+results_charge_classic = []
+results_success_classic = []
+charge_log_classic = []
+
+for ep in range(1, num_episodes+1):
+    fail_flag = 0
+    charge_count = 0
+    success_count = 0
+    battery = CAPACITY
+    prev_avg_speed = None
+    next_departure_time = haftalik_program.loc[0, 'dep_min']
+    for idx in range(len(haftalik_program)):
+        if idx == 0:
+            current_time = haftalik_program.loc[0, 'dep_min']
+        else:
+            current_time = next_departure_time
+
+        start_terminal = haftalik_program.loc[idx, 'Kalkış Noktası']
+        end_terminal   = haftalik_program.loc[idx, 'Varış Noktası']
+        tarih_str      = haftalik_program.loc[idx, 'tarih']
+        tarih_dt       = pd.to_datetime(tarih_str).date()
+        if start_terminal == "Kadıköy":
+            stops_seq = stops_kadikoy_to_kiraz
+            seg_distances = distances_kadikoy_to_kiraz
+        else:
+            stops_seq = stops_kiraz_to_kadikoy
+            seg_distances = distances_kiraz_to_kadikoy
+
+        break_minutes = haftalik_program.loc[idx-1, 'break_min'] if idx > 0 else 0
+        added_energy = (350.0 / 60.0) * break_minutes
+        battery += added_energy
+        charge_count += 1 if idx > 0 else 0
+        charge_log_classic.append({
+            "epizod": ep,
+            "gun": tarih_str,
+            "haftaici_gun": pd.to_datetime(tarih_str).strftime("%A"),
+            "saat": int(current_time // 60) % 24,
+            "sefer_no": idx + 1,
+            "kalkis": start_terminal,
+            "varis": end_terminal,
+            "batarya_yuzde": round((battery / CAPACITY) * 100, 1)
+        })
+
+        reward = 0.0
+        for seg_idx, dist_m in enumerate(seg_distances):
+            dist_km = dist_m / 1000.0
+            hour = int(current_time // 60) % 24
+            traffic_key = (tarih_dt, hour, round(route_df.loc[stops_seq[seg_idx], 'lat'], 6), round(route_df.loc[stops_seq[seg_idx], 'lon'], 6))
+            avg_speed, density = traffic_data.get(traffic_key, (30, 1))
+            dens_factor = min(density / 5.0, 0.2)
+            speed_factor = (30 - avg_speed) / 30.0
+            if speed_factor < 0: speed_factor = 0
+
+            consumption = dist_km * 1.4 * (1 + dens_factor) * (1 + speed_factor)
+            regen_energy = 0.0
+            if prev_avg_speed is not None and avg_speed < prev_avg_speed:
+                regen_energy = consumption * REGEN_RATIO
+                battery += regen_energy
+            prev_avg_speed = avg_speed
+            battery -= consumption
+
+            travel_time_min = (dist_km / avg_speed) * 60.0 if avg_speed > 0 else 0.0
+            current_time += travel_time_min
+
+            temp = temperature_data.get((tarih_str, hour), T_MIN)
+            temp_factor = (temp - T_MIN) / (T_MAX - T_MIN)
+            temp_factor = max(0, min(temp_factor, 1))
+            travel_time_hour = travel_time_min / 60.0
+            consumption_klima = KLIMA_TUKETIM_BASE * (1 + temp_factor) * travel_time_hour
+            battery -= consumption_klima
+
+            if seg_idx < len(seg_distances) - 1:
+                current_time += 1
+            if battery <= 0:
+                fail_flag = 1
+                reward += -1500.0
+                break
+        if battery <= 0:
+            break
+
+        success_count += 1
+        next_departure_time = current_time + haftalik_program.loc[idx, 'break_min']
+
+    results_fail_classic.append(fail_flag)
+    results_charge_classic.append(charge_count)
+    results_success_classic.append(success_count)
+
+# ==== 8. Sonuçların Kaydı ve Karşılaştırmalı Grafikler ====
+results_csv_q = os.path.join(base_dir, "episode_results_500_qlearning.csv")
+results_csv_classic = os.path.join(base_dir, "episode_results_500_classic.csv")
+fail_png = os.path.join(base_dir, "fail_per_episode_500_compare.png")
+charge_png = os.path.join(base_dir, "charge_per_episode_500_compare.png")
+charge_log_excel_q = os.path.join(base_dir, "charge_actions_log_q.xlsx")
+charge_log_excel_classic = os.path.join(base_dir, "charge_actions_log_classic.xlsx")
+
+print("\n>> Sonuçlar ve grafikler kaydediliyor...")
+
+# Epizod başına başarı, şarj, yolda kalma sayısı CSV'ye kaydediliyor
+pd.DataFrame({
+    "Episode": list(range(1, num_episodes+1)),
+    "Fail": results_fail_q,
+    "Charge": results_charge_q,
+    "Success": results_success_q
+}).to_csv(results_csv_q, index=False)
+
+pd.DataFrame({
+    "Episode": list(range(1, num_episodes+1)),
+    "Fail": results_fail_classic,
+    "Charge": results_charge_classic,
+    "Success": results_success_classic
+}).to_csv(results_csv_classic, index=False)
+
+# Şarj karar logları Excel'e yazılıyor
+pd.DataFrame(charge_log_q).to_excel(charge_log_excel_q, index=False)
+pd.DataFrame(charge_log_classic).to_excel(charge_log_excel_classic, index=False)
+
+# ===================== GRAFİKLER =====================
+# Q-Learning'in şarj karar ısı haritası (hafta ve saat bazında yoğunluk)
+charge_log_df_q = pd.DataFrame(charge_log_q)
+if not charge_log_df_q.empty:
+    gun_saat_df = charge_log_df_q.groupby(["gun","saat"]).size().reset_index(name="adet")
+    pivot_tbl = gun_saat_df.pivot(index='gun', columns='saat', values='adet').fillna(0)
+    plt.figure(figsize=(14,5), dpi=300)
+    ax = sns.heatmap(pivot_tbl, cmap="YlOrRd", linewidths=0.5, annot=True, fmt=".0f")
+    plt.title("Q-Learning Otobüsü: Hafta/Saat Bazında Toplam Şarj Aksiyonu Yoğunluğu\n(Renk: 500 epizodda seçilen şarj aksiyonu adedi)", fontsize=16)
+    plt.xlabel("Saat", fontsize=14)
+    plt.ylabel("Gün", fontsize=14)
+    cbar = ax.collections[0].colorbar
+    cbar.set_label('Toplam Şarj Aksiyonu (Frekans)', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_dir, "charge_heatmap_haftalik_qlearning.png"), dpi=300)
+    plt.savefig(os.path.join(base_dir, "charge_heatmap_haftalik_qlearning.pdf"), dpi=300)
+    plt.close()
+
+# Diğer karşılaştırmalı sonuç grafiklerinin hazırlanışı
+
+
+plt.figure(figsize=(10, 5), dpi=300)
+plt.plot(range(1, len(rewards)+1), rewards, color='royalblue', linewidth=1, label='Orijinal Toplam Ödül')
+plt.title('Epizod Bazında Toplam Ödül (Q-Learning)', fontsize=15)
+plt.xlabel('Epizod (Hafta)', fontsize=13)
+plt.ylabel('Toplam Ödül', fontsize=13)
+plt.legend(fontsize=13)
+plt.grid(True, linestyle='--', alpha=0.8)
+plt.tight_layout()
+plt.savefig(os.path.join(base_dir, "reward_per_episode_qlearning_compare.png"), dpi=300)
+plt.show()
+plt.close()
+
+
+window = 5  # 5 epizotluk pencereyle hareketli ortalama (isteğe göre değiştir)
+rolling_mean = pd.Series(rewards).rolling(window, min_periods=1).mean()
+
+plt.figure(figsize=(10, 5), dpi=300)
+plt.plot(range(1, len(rolling_mean)+1), rolling_mean, color='purple', linewidth=2, label=f'{window} Epizotluk Kayan Ortalama')
+plt.title('Epizod Bazında Toplam Ödül (Q-Learning)', fontsize=15)
+plt.xlabel('Epizod (Hafta)', fontsize=13)
+plt.ylabel('Toplam Ödül', fontsize=13)
+plt.legend(fontsize=13)
+plt.grid(True, linestyle='--', alpha=0.8)
+plt.tight_layout()
+plt.savefig(os.path.join(base_dir, "reward_per_episode_qlearning_with_ma.png"), dpi=300)
+plt.show()
+plt.close()
+
+
+plt.figure(figsize=(7,5), dpi=300)
+plt.bar(['Q-Learning', 'Klasik'], [results_charge_q[-1], results_charge_classic[-1]], color=['green', 'gray'])
+plt.ylabel('Son Epizod Şarj Aksiyonu', fontsize=14)
+plt.title('Q-Learning vs. Klasik: Son Epizodda Toplam Şarj', fontsize=15)
+plt.tight_layout()
+plt.savefig(os.path.join(base_dir, "charge_count_last_episode_compare.png"), dpi=300)
+plt.close()
+
+plt.figure(figsize=(10,5), dpi=300)
+plt.plot(range(1, num_episodes+1), results_fail_q, color='red', marker='o', linewidth=2, markersize=4, label='Q-Learning')
+plt.plot(range(1, num_episodes+1), results_fail_classic, color='gray', marker='x', linewidth=2, markersize=4, linestyle='--', label='Her Sefer Sonu Şarj (Klasik)')
+plt.title('Epizod Bazında Yolda Kalma Karşılaştırması', fontsize=15)
+plt.xlabel('Epizod (Hafta)', fontsize=13)
+plt.ylabel('Yolda Kalma (0=Yok, 1=Var)', fontsize=13)
+plt.yticks([0,1])
+plt.legend(fontsize=13)
+plt.grid(True, linestyle='--', alpha=0.8)
+plt.tight_layout()
+plt.savefig(fail_png, dpi=300)
+plt.close()
+
+plt.figure(figsize=(10,5), dpi=300)
+plt.plot(range(1, num_episodes+1), results_charge_q, color='green', marker='o', linewidth=2, markersize=4, label='Q-Learning')
+plt.plot(range(1, num_episodes+1), results_charge_classic, color='gray', marker='x', linewidth=2, markersize=4, linestyle='--', label='Her Sefer Sonu Şarj (Klasik)')
+plt.title('Epizod Bazında Şarj Karşılaştırması', fontsize=15)
+plt.xlabel('Epizod (Hafta)', fontsize=13)
+plt.ylabel('Şarj Aksiyonu', fontsize=13)
+plt.legend(fontsize=13)
+plt.grid(True, linestyle='--', alpha=0.8)
+plt.tight_layout()
+plt.savefig(charge_png, dpi=300)
+plt.close()
+
+plt.figure(figsize=(12, 5), dpi=300)
+plt.plot(range(1, num_episodes+1), results_charge_q, label="Q-Learning", color="green", marker='o', markersize=3)
+plt.plot(range(1, num_episodes+1), results_charge_classic, label="Klasik", color="gray", linestyle="--", marker='x', markersize=3)
+plt.xlabel("Epizod (Hafta)", fontsize=13)
+plt.ylabel("Şarj Kararı (Epizod başına)", fontsize=13)
+plt.title("Epizod Bazında Şarj Kararları", fontsize=15)
+plt.legend(fontsize=12)
+plt.grid(True, linestyle="--", alpha=0.7)
+plt.tight_layout()
+plt.savefig(os.path.join(base_dir, "charge_decision_per_episode.png"), dpi=300)
+plt.close()
+
+window = 10  # Kaç epizotluk pencere ile ortalama alalım
+rewards = np.array(results_reward_q)
+rolling_mean = pd.Series(rewards).rolling(window, min_periods=1).mean()
+
+plt.figure(figsize=(10, 5), dpi=300)
+plt.plot(range(1, len(rewards)+1), rewards, label='Epizod Bazında Ödül', color='royalblue', alpha=0.5, linewidth=1)
+plt.plot(range(1, len(rolling_mean)+1), rolling_mean, label=f'{window} Epizotluk Hareketli Ortalama', color='darkorange', linewidth=2)
+
+plt.title('Q-Learning: Epizod Bazında Toplam Ödül', fontsize=16)
+plt.xlabel('Epizod (Hafta)', fontsize=14)
+plt.ylabel('Toplam Ödül', fontsize=14)
+plt.legend(fontsize=12)
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
+print(">> Q-Learning ve Klasik otobüs karşılaştırması tamamlandı! Sonuçlar:", base_dir)
