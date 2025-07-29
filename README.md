@@ -13,4 +13,10 @@ This project demonstrates the optimization of electric bus battery charging usin
 - Jupyter Notebook
 - (Optionally: TensorFlow/Keras if deep RL is included)
 
-## Project Structure
+# Electric Bus Charging Optimization: Q-Learning vs. Manual Strategy
+
+⚠️ **Work in Progress**  
+This project is under active development. Some features and modules (e.g., deep RL, large-scale experiments) will be released in upcoming updates. The codebase and documentation may change.
+
+Feel free to fork or star the project for future updates!
+
